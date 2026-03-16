@@ -130,7 +130,7 @@ def _extract_rows(data) -> list[dict]:
             return data
         return []
     if isinstance(data, dict):
-        for key in ("facilities", "violations"):
+        for key in ("items", "facilities", "violations"):
             if key in data and isinstance(data[key], list):
                 return data[key]
         # sources — only if it's a list of dicts (local mode), not strings (API)
