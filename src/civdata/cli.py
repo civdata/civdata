@@ -1,7 +1,9 @@
 """CivData CLI — query environmental compliance data from the terminal.
 
-Queries the CivData REST API for environmental facility data, violations,
-risk scores, and screening reports across all 50 US states + DC.
+Remote mode (default): queries the CivData REST API via httpx.
+Local mode (--local): queries a SQLite database directly via the pipeline
+services layer. Requires the `pipeline` package to be importable (i.e.,
+running from within the vdb project).
 
 Usage:
     civdata search --state TX --county Harris
@@ -11,6 +13,10 @@ Usage:
     civdata screen "123 Main St, Houston, TX"
     civdata stats
     civdata sources
+
+    # Local mode (query SQLite directly, requires pipeline package):
+    civdata --local search --state TX --limit 5
+    civdata --local --db /path/to/pipeline.db nearby "30.27,-97.74"
 """
 
 from __future__ import annotations
@@ -21,6 +27,32 @@ import json
 import sys
 
 _DEFAULT_API_URL = "https://civdata.dev"
+
+
+# ---------------------------------------------------------------------------
+# Local DB helpers (lazy imports — only loaded when --local is used)
+# ---------------------------------------------------------------------------
+
+
+def _get_conn(args):
+    """Open a local DB connection. Requires pipeline package."""
+    from pathlib import Path
+
+    from pipeline.config import DB_PATH
+    from pipeline.db import get_connection
+
+    db = Path(args.db) if args.db else DB_PATH
+    return get_connection(db)
+
+
+def _check_local_available():
+    """Check if local mode is available (pipeline package importable)."""
+    try:
+        import pipeline.services  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -188,47 +220,212 @@ def cmd_search(args):
     if not any([args.query, args.state, args.zip, args.county, args.program]):
         print("Provide at least one filter: --query, --state, --zip, --county, --program", file=sys.stderr)
         sys.exit(1)
-    params = {"limit": args.limit}
-    if args.query:
-        params["query"] = args.query
-    if args.state:
-        params["state"] = args.state
-    if args.zip:
-        params["zip_code"] = args.zip
-    if args.county:
-        params["county"] = args.county
-    if args.program:
-        params["program"] = args.program
-    _output(_api_get(args, "/facilities", params), args.format)
+
+    if not args.local:
+        params = {"limit": args.limit}
+        if args.query:
+            params["query"] = args.query
+        if args.state:
+            params["state"] = args.state
+        if args.zip:
+            params["zip_code"] = args.zip
+        if args.county:
+            params["county"] = args.county
+        if args.program:
+            params["program"] = args.program
+        _output(_api_get(args, "/facilities", params), args.format)
+        return
+
+    from pipeline import services
+
+    conn = _get_conn(args)
+    try:
+        result = services.search_facilities_by_filter(
+            conn,
+            query=args.query,
+            state=args.state,
+            zip_code=args.zip,
+            county=args.county,
+            program=args.program,
+            limit=args.limit,
+        )
+        if result is None:
+            print("No filters matched.", file=sys.stderr)
+            sys.exit(1)
+        _output(result, args.format)
+    finally:
+        conn.close()
 
 
 def cmd_nearby(args):
-    params = {"address": args.address, "radius": args.radius, "limit": args.limit}
-    _output(_api_get(args, "/search", params), args.format)
+    if not args.local:
+        params = {"address": args.address, "radius": args.radius, "limit": args.limit}
+        _output(_api_get(args, "/search", params), args.format)
+        return
+
+    from pipeline import services
+    from pipeline.geo import geocode_address
+
+    coords = services.parse_lat_lon(args.address)
+    matched_address = None
+    if coords:
+        center_lat, center_lon = coords
+    else:
+        gc = geocode_address(args.address)
+        if not gc:
+            print(f"Could not geocode: {args.address}", file=sys.stderr)
+            sys.exit(1)
+        center_lat, center_lon, matched_address = gc
+
+    conn = _get_conn(args)
+    try:
+        center_state = None
+        if matched_address:
+            from pipeline.geo import _extract_state
+            center_state = _extract_state(matched_address)
+        if center_state is None:
+            from pipeline.geo import reverse_geocode_state
+            center_state = reverse_geocode_state(center_lat, center_lon)
+
+        results = services.search_radius(
+            conn, center_lat, center_lon, args.radius,
+            limit=args.limit, center_state=center_state,
+        )
+        out = {
+            "center": {"lat": center_lat, "lon": center_lon},
+            "radius_miles": args.radius,
+            "total_found": len(results),
+            "facilities": results,
+        }
+        if matched_address:
+            out["center"]["matched_address"] = matched_address
+        _output(out, args.format)
+    finally:
+        conn.close()
 
 
 def cmd_facility(args):
-    _output(_api_get(args, f"/facilities/{args.source}/{args.source_id}"), args.format)
+    if not args.local:
+        _output(_api_get(args, f"/facilities/{args.source}/{args.source_id}"), args.format)
+        return
+
+    from pipeline import services
+
+    conn = _get_conn(args)
+    try:
+        result = services.get_facility_detail(conn, args.source, args.source_id)
+        if result is None:
+            print(f"Not found: {args.source}/{args.source_id}", file=sys.stderr)
+            sys.exit(1)
+        _output(result, args.format)
+    finally:
+        conn.close()
 
 
 def cmd_violations(args):
-    params = {"limit": args.limit}
-    if args.since:
-        params["since"] = args.since
-    _output(_api_get(args, f"/facilities/{args.source}/{args.source_id}/violations", params), args.format)
+    if not args.local:
+        params = {"limit": args.limit}
+        if args.since:
+            params["since"] = args.since
+        _output(_api_get(args, f"/facilities/{args.source}/{args.source_id}/violations", params), args.format)
+        return
+
+    from pipeline import services
+
+    conn = _get_conn(args)
+    try:
+        clauses = [
+            "facility_source = ? AND facility_source_id = ?",
+            "LOWER(COALESCE(violation_type,'')) != 'no violation identified'",
+        ]
+        params: list = [args.source, args.source_id]
+
+        if args.since:
+            try:
+                since_date = services.parse_since(args.since)
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                sys.exit(1)
+            clauses.append("violation_date >= ?")
+            params.append(since_date)
+
+        where = f"WHERE {' AND '.join(clauses)}"
+
+        total = conn.execute(f"SELECT COUNT(*) FROM violations {where}", params).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM violations {where} ORDER BY violation_date DESC LIMIT ?",
+            params + [args.limit],
+        ).fetchall()
+
+        result = {
+            "facility": f"{args.source}/{args.source_id}",
+            "total_violations": total,
+            "returned": len(rows),
+            "violations": services.enrich_violations(services.rows_to_dicts(rows)),
+        }
+        _output(result, args.format)
+    finally:
+        conn.close()
 
 
 def cmd_screen(args):
-    params = {"address": args.address, "radius": args.radius, "format": "json"}
-    _output(_api_get(args, "/reports/screening", params), args.format)
+    if not args.local:
+        params = {"address": args.address, "radius": args.radius, "format": "json"}
+        _output(_api_get(args, "/reports/screening", params), args.format)
+        return
+
+    from pipeline import services
+    from pipeline.geo import geocode_address
+
+    coords = services.parse_lat_lon(args.address)
+    resolved_address = None
+    if coords:
+        center_lat, center_lon = coords
+    else:
+        gc = geocode_address(args.address)
+        if not gc:
+            print(f"Could not geocode: {args.address}", file=sys.stderr)
+            sys.exit(1)
+        center_lat, center_lon, resolved_address = gc
+
+    conn = _get_conn(args)
+    try:
+        report = services.build_screening_report(
+            conn, center_lat, center_lon, args.radius, resolved_address,
+        )
+        _output(report, args.format)
+    finally:
+        conn.close()
 
 
 def cmd_stats(args):
-    _output(_api_get(args, "/stats"), args.format)
+    if not args.local:
+        _output(_api_get(args, "/stats"), args.format)
+        return
+
+    from pipeline import services
+
+    conn = _get_conn(args)
+    try:
+        result = services.get_coverage_stats(conn)
+        _output(result, args.format)
+    finally:
+        conn.close()
 
 
 def cmd_sources(args):
-    _output(_api_get(args, "/sources"), args.format)
+    if not args.local:
+        _output(_api_get(args, "/sources"), args.format)
+        return
+
+    from pipeline import services
+
+    conn = _get_conn(args)
+    try:
+        sources = services.get_all_active_sources(conn)
+        _output(sources, args.format)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +443,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--api-url", default=_DEFAULT_API_URL, help=f"API base URL (default: {_DEFAULT_API_URL})")
     common.add_argument("--api-key", default=None, help="API key for authenticated endpoints")
+    common.add_argument(
+        "--local", action="store_true",
+        help="Query local SQLite DB instead of the API (requires pipeline package)",
+    )
+    common.add_argument("--db", default=None, help="SQLite database path (local mode only)")
 
     parser = argparse.ArgumentParser(
         prog="civdata",
@@ -300,8 +502,17 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    # Workaround: argparse parents with store_true flags get overwritten by
+    # subparser defaults. If --local appears anywhere in argv, honor it.
+    if "--local" in sys.argv:
+        args.local = True
+
     if not args.command:
         parser.print_help()
+        sys.exit(1)
+
+    if args.local and not _check_local_available():
+        print("Local mode requires the pipeline package. Run from the vdb project or install it.", file=sys.stderr)
         sys.exit(1)
 
     dispatch = {
