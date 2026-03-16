@@ -46,13 +46,35 @@ def _get_conn(args):
 
 
 def _check_local_available():
-    """Check if local mode is available (pipeline package importable)."""
+    """Check if local mode is available (pipeline package importable).
+
+    Tries to find the pipeline package. If not on sys.path, checks CWD
+    and the CIVDATA_PROJECT_DIR env var.
+    """
     try:
         import pipeline.services  # noqa: F401
 
         return True
     except ImportError:
-        return False
+        pass
+
+    import os
+    from pathlib import Path
+
+    candidates = [
+        Path.cwd(),
+        Path(os.environ.get("CIVDATA_PROJECT_DIR", "")),
+    ]
+    for candidate in candidates:
+        if (candidate / "pipeline" / "services.py").exists():
+            sys.path.insert(0, str(candidate))
+            try:
+                import pipeline.services  # noqa: F401
+
+                return True
+            except ImportError:
+                sys.path.pop(0)
+    return False
 
 
 # ---------------------------------------------------------------------------
