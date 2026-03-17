@@ -7,12 +7,6 @@ Covers all 50 states + DC with data from EPA (ECHO, RCRA, CAA, SDWA, SEMS) and 5
 ## Install
 
 ```bash
-pip install civdata
-```
-
-Or install from source:
-
-```bash
 pip install git+https://github.com/CivData/civdata.git
 ```
 
