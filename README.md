@@ -4,6 +4,8 @@ Query US environmental compliance data from the terminal — facilities, violati
 
 Covers all 50 states + DC with data from EPA (ECHO, RCRA, CAA, SDWA, SEMS) and 53 state-level environmental agencies.
 
+Dashboard:  https://civdata.dev
+
 ## Install
 
 ```bash
